@@ -12,7 +12,7 @@ from tensorboardX import SummaryWriter
 from torch.nn.modules.loss import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from utils import DiceLoss
+from utils import DiceLoss, ELoss
 from torchvision import transforms
 from utils import test_single_volume
 
@@ -41,6 +41,7 @@ def trainer_synapse(args, model, snapshot_path):
     model.train()
     ce_loss = CrossEntropyLoss()
     dice_loss = DiceLoss(num_classes)
+    edge_loss = ELoss(num_classes)
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
     writer = SummaryWriter(snapshot_path + '/log')
     iter_num = 0
@@ -56,7 +57,11 @@ def trainer_synapse(args, model, snapshot_path):
             outputs = model(image_batch)
             loss_ce = ce_loss(outputs, label_batch[:].long())
             loss_dice = dice_loss(outputs, label_batch, softmax=True)
-            loss = 0.4 * loss_ce + 0.6 * loss_dice
+            loss_edge = edge_loss(outputs, edge_batch, softmax=True)
+            if epoch_num >= 50:
+                loss = loss_dice * 0.5+ loss_ce * 0.5 +loss_edge * 0.1
+            else:
+                loss = loss_dice * 0.5+ loss_ce * 0.5
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
