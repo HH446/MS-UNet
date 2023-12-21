@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import numpy as np
+import math
 
 
 class Mlp(nn.Module):
@@ -553,6 +556,247 @@ class PatchEmbed(nn.Module):
             flops += Ho * Wo * self.embed_dim
         return flops
 
+
+def Norm_layer(norm_cfg, inplanes):
+    norm_op_kwargs = {'eps': 1e-5, 'affine': True, 'momentum': 0.1}
+    if norm_cfg == 'BN':
+        out = nn.BatchNorm2d(inplanes)
+    elif norm_cfg == 'SyncBN':
+        out = nn.SyncBatchNorm(inplanes)
+    elif norm_cfg == 'GN':
+        out = nn.GroupNorm(16, inplanes)
+    elif norm_cfg == 'IN':
+        out = nn.InstanceNorm2d(inplanes, **norm_op_kwargs)
+
+    return out
+
+
+def Activation_layer(activation_cfg, inplace=True):
+    if activation_cfg == 'ReLU':
+        out = nn.ReLU(inplace=inplace)
+    elif activation_cfg == 'LeakyReLU':
+        out = nn.LeakyReLU(negative_slope=1e-2, inplace=inplace)
+
+    return out
+
+
+class ConvNormNonlin(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=1,
+                 norm_cfg='IN', activation_cfg='LeakyReLU'):
+        super(ConvNormNonlin, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups)
+        self.norm = Norm_layer(norm_cfg, out_channels)
+        self.nonlin = Activation_layer(activation_cfg)
+
+    def forward(self, x):
+        x = self.nonlin(self.norm(self.conv(x)))
+        return x
+
+class GaussianBlurConv(nn.Module):
+    def __init__(self, channels=3):
+        super(GaussianBlurConv, self).__init__()
+        self.channels = channels
+        self.bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        kernel = [[0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633],
+                  [0.00655965, 0.05472157, 0.11098164, 0.05472157, 0.00655965],
+                  [0.01330373, 0.11098164, 0.22508352, 0.11098164, 0.01330373],
+                  [0.00655965, 0.05472157, 0.11098164, 0.05472157, 0.00655965],
+                  [0.00078633, 0.00655965, 0.01330373, 0.00655965, 0.00078633]]
+        kernel = torch.FloatTensor(kernel).unsqueeze(0).unsqueeze(0)
+        kernel = np.repeat(kernel, self.channels, axis=0)
+        self.gaussian_weight = nn.Parameter(data=kernel, requires_grad=False)
+        self.gaussian_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),
+                                             requires_grad=True)
+ 
+    def forward(self, x):
+        if torch.cuda.is_available():
+            self.gaussian_factor = self.gaussian_factor.cuda()
+            if isinstance(self.bias, nn.Parameter):
+                self.bias = self.bias.cuda()
+
+        gaussian_weight = self.gaussian_weight * self.gaussian_factor
+
+        if torch.cuda.is_available():
+            gaussian_weight = gaussian_weight.cuda()
+        # print("gaussian_shape:", gaussian_weight.shape)
+        x = F.conv2d(x, gaussian_weight, self.bias, padding=2, groups=self.channels)
+        return x
+
+
+class AnisoDiff2D(nn.Module):
+ 
+    def __init__(self, num_iter=10, delta_t=1/7, kappa=30, option=2, channels=3):
+ 
+        super(AnisoDiff2D, self).__init__()
+ 
+        self.num_iter = num_iter
+        self.delta_t = delta_t
+        self.kappa = kappa
+        self.option = option
+        self.channels = channels
+
+        self.hN_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hS_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hE_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hW_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hNE_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hSE_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hSW_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+        self.hNW_bias = nn.Parameter(torch.zeros(size=(channels,), dtype=torch.float32), requires_grad=True)
+ 
+        self.hN_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 1, 0], [0, -1, 0], [0, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False)  
+        self.hN_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hS_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 0], [0, -1, 0], [0, 1, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False) 
+        self.hS_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hE_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 0], [0, -1, 1], [0, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False)
+        self.hE_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hW_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 0], [1, -1, 0], [0, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False)
+        self.hW_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hNE_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 1], [0, -1, 0], [0, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False)
+        self.hNE_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hSE_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 0], [0, -1, 0], [0, 0, 1]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False) 
+        self.hSE_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hSW_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[0, 0, 0], [0, -1, 0], [1, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False) 
+        self.hSW_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+        self.hNW_weight = nn.Parameter(data=np.repeat(torch.FloatTensor(
+                                    [[1, 0, 0], [0, -1, 0], [0, 0, 0]]).unsqueeze(0).unsqueeze(0),
+                                     self.channels, axis=0), 
+                                     requires_grad=False) 
+        self.hNW_factor = nn.Parameter(torch.ones(size=(3, 1, 1, 1), dtype=torch.float32),requires_grad=True)
+ 
+    def forward(self, diff_im):
+
+        if torch.cuda.is_available():
+            self.hN_factor = self.hN_factor.cuda()
+            self.hS_factor = self.hS_factor.cuda()
+            self.hW_factor = self.hW_factor.cuda()
+            self.hE_factor = self.hE_factor.cuda()
+            self.hNE_factor = self.hNE_factor.cuda()
+            self.hSE_factor = self.hSE_factor.cuda()
+            self.hSW_factor = self.hSW_factor.cuda()
+            self.hNW_factor = self.hNW_factor.cuda()
+            if isinstance(self.hN_bias, nn.Parameter):
+                self.hN_bias = self.hN_bias.cuda()
+                self.hS_bias = self.hS_bias.cuda()
+                self.hW_bias = self.hW_bias.cuda()
+                self.hE_bias = self.hE_bias.cuda()
+                self.hNE_bias = self.hNE_bias.cuda()
+                self.hSE_bias = self.hSE_bias.cuda()
+                self.hSW_bias = self.hSW_bias.cuda()
+                self.hNW_bias = self.hNW_bias.cuda()
+
+        # diff_im = x
+ 
+        dx = 1; dy = 1; dd = math.sqrt(2)
+
+        hN = self.hN_weight * self.hN_factor
+        hS = self.hS_weight * self.hS_factor
+        hW = self.hW_weight * self.hW_factor
+        hE = self.hE_weight * self.hE_factor
+        hNE = self.hNE_weight * self.hNE_factor
+        hSE = self.hSE_weight * self.hSE_factor
+        hSW = self.hSW_weight * self.hSW_factor
+        hNW = self.hNW_weight * self.hNW_factor
+
+        if torch.cuda.is_available():
+            hN = hN.cuda()
+            hS = hS.cuda()
+            hW = hW.cuda()
+            hE = hE.cuda()
+            hNE = hNE.cuda()
+            hSE = hSE.cuda()
+            hSW = hSW.cuda()
+            hNW = hNW.cuda()
+
+        for i in range(self.num_iter):
+            nablaN = F.conv2d(diff_im, hN, self.hN_bias, padding=1, groups=self.channels)
+            nablaS = F.conv2d(diff_im, hS, self.hS_bias, padding=1, groups=self.channels)
+            nablaW = F.conv2d(diff_im, hW, self.hW_bias, padding=1, groups=self.channels)
+            nablaE = F.conv2d(diff_im, hE, self.hE_bias, padding=1, groups=self.channels)
+            nablaNE = F.conv2d(diff_im, hNE, self.hNE_bias, padding=1, groups=self.channels)
+            nablaSE = F.conv2d(diff_im, hSE, self.hSE_bias, padding=1, groups=self.channels)
+            nablaSW = F.conv2d(diff_im, hSW, self.hSW_bias, padding=1, groups=self.channels)
+            nablaNW = F.conv2d(diff_im, hNW, self.hNW_bias, padding=1, groups=self.channels)
+ 
+            cN = 0; cS = 0; cW = 0; cE = 0; cNE = 0; cSE = 0; cSW = 0; cNW = 0
+ 
+            if self.option == 1:
+                cN = torch.exp(-(nablaN/self.kappa)**2)
+                cS = torch.exp(-(nablaS/self.kappa)**2)
+                cW = torch.exp(-(nablaW/self.kappa)**2)
+                cE = torch.exp(-(nablaE/self.kappa)**2)
+                cNE = torch.exp(-(nablaNE/self.kappa)**2)
+                cSE = torch.exp(-(nablaSE/self.kappa)**2)
+                cSW = torch.exp(-(nablaSW/self.kappa)**2)
+                cNW = torch.exp(-(nablaNW/self.kappa)**2)
+            elif self.option == 2:
+                cN = 1/(1+(nablaN/self.kappa)**2)
+                cS = 1/(1+(nablaS/self.kappa)**2)
+                cW = 1/(1+(nablaW/self.kappa)**2)
+                cE = 1/(1+(nablaE/self.kappa)**2)
+                cNE = 1/(1+(nablaNE/self.kappa)**2)
+                cSE = 1/(1+(nablaSE/self.kappa)**2)
+                cSW = 1/(1+(nablaSW/self.kappa)**2)
+                cNW = 1/(1+(nablaNW/self.kappa)**2)
+ 
+            diff_im = diff_im + self.delta_t * (
+ 
+                (1/dy**2)*cN*nablaN +
+                (1/dy**2)*cS*nablaS +
+                (1/dx**2)*cW*nablaW +
+                (1/dx**2)*cE*nablaE +
+ 
+                (1/dd**2)*cNE*nablaNE +
+                (1/dd**2)*cSE*nablaSE +
+                (1/dd**2)*cSW*nablaSW +
+                (1/dd**2)*cNW*nablaNW
+            )
+ 
+        return diff_im
+
+
+class ImgDenoising(nn.Module):
+    def __init__(self, channels=3, norm_cfg='IN', activation_cfg='LeakyReLU'):
+        super(ImgDenoising, self).__init__()
+
+        self.gaussian = GaussianBlurConv()
+        self.anisodiff = AnisoDiff2D()
+        self.flow = nn.Conv2d(channels * 3, channels, kernel_size=1)
+        self.norm = Norm_layer(norm_cfg, channels)
+
+    def forward(self, x):
+        
+        x_gauss = self.gaussian(x)
+        x_anisodiff = self.anisodiff(x)
+        flow = torch.cat([x, x_gauss, x_anisodiff], dim=1)
+        flow = self.norm(self.flow(flow))
+        attn = torch.sigmoid(flow)
+        x = x * attn
+
+        return x
+
+
 class ModelSys(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -599,6 +843,7 @@ class ModelSys(nn.Module):
         self.num_features_up = int(embed_dim * 2)
         self.mlp_ratio = mlp_ratio
         self.final_upsample = final_upsample
+        self.ImgDenoising = ImgDenoising()
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -801,6 +1046,7 @@ class ModelSys(nn.Module):
         return x
 
     def forward(self, x):
+        x = self.ImgDenoising(x)
         x, x_downsample = self.forward_features(x)
         x = self.forward_up_features(x,x_downsample)
         x = self.up_x4(x)
